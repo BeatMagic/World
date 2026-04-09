@@ -3,7 +3,7 @@ C99 = gcc -std=c99
 LINK = g++
 AR = ar
 #DEBUG_FLAG=-g
-CXXFLAGS = -O1 -Wall -fPIC $(DEBUG_FLAG)
+CXXFLAGS = -O3 -Wall -fPIC -march=native -ffast-math -funroll-loops $(DEBUG_FLAG)
 CFLAGS = $(CXXFLAGS)
 ARFLAGS = -rv
 OUT_DIR = ./build

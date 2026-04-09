@@ -72,6 +72,14 @@ target_include_directories(world_tool PUBLIC $<INSTALL_INTERFACE:include>
 add_library(world::core ALIAS world)
 add_library(world::tool ALIAS world_tool)
 
+# Optimization flags for Release builds
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+target_compile_options(world PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native -ffast-math -funroll-loops>
+)
+
 foreach (lib world world_tool)
     set_target_properties(${lib}
             PROPERTIES

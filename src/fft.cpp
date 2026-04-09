@@ -18,6 +18,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 void cdft(int n, int isgn, double *a, int *ip, double *w);
 void rdft(int n, int isgn, double *a, int *ip, double *w);
@@ -32,7 +33,10 @@ static void BackwardFFT(fft_plan p) {
       p.input[i * 2 + 1]  = -p.c_in[i][1];
     }
     rdft(p.n, -1, p.input, p.ip, p.w);
-    for (int i = 0; i < p.n; ++i) p.out[i] = p.input[i] * 2.0;
+    // Scale by 2.0 and copy to output
+    const double *__restrict__ src = p.input;
+    double *__restrict__ dst = p.out;
+    for (int i = 0; i < p.n; ++i) dst[i] = src[i] * 2.0;
   } else {  // c2c
     for (int i = 0; i < p.n; ++i) {
       p.input[i * 2] = p.c_in[i][0];
@@ -48,7 +52,7 @@ static void BackwardFFT(fft_plan p) {
 
 static void ForwardFFT(fft_plan p) {
   if (p.c_in == NULL) {  // r2c
-    for (int i = 0; i < p.n; ++i) p.input[i] = p.in[i];
+    memcpy(p.input, p.in, p.n * sizeof(double));
     rdft(p.n, 1, p.input, p.ip, p.w);
     p.c_out[0][0] = p.input[0];
     p.c_out[0][1] = 0.0;

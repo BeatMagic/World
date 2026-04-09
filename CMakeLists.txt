@@ -48,6 +48,7 @@ add_library(world STATIC
         src/world/cheaptrick.h
         src/world/codec.h
         src/world/common.h
+        src/world/compositef0.h
         src/world/constantnumbers.h
         src/world/d4c.h
         src/world/dio.h
@@ -61,6 +62,7 @@ add_library(world STATIC
         src/cheaptrick.cpp
         src/codec.cpp
         src/common.cpp
+        src/compositef0.cpp
         src/d4c.cpp
         src/dio.cpp
         $<IF:$<STREQUAL:${WORLD_FFT_BACKEND},fftw3>,src/fft_fftw3.cpp,src/fft.cpp>

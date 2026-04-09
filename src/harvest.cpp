@@ -8,6 +8,7 @@
 #include "world/harvest.h"
 
 #include <math.h>
+#include <string.h>
 
 #include "world/common.h"
 #include "world/constantnumbers.h"
@@ -93,58 +94,84 @@ static void GetWaveformAndSpectrum(const double *x, int x_length,
 }
 
 //-----------------------------------------------------------------------------
+// Fast NuttallWindow using recursive oscillators instead of cos() calls.
+// Replaces 3 cos() per sample with 3 complex rotations (6 mul + 3 add).
+//-----------------------------------------------------------------------------
+static void FastNuttallWindow(int y_length, double *y) {
+  if (y_length <= 1) {
+    if (y_length == 1) y[0] = 1.0;
+    return;
+  }
+  double phase_step = 2.0 * world::kPi / (y_length - 1);
+  double cos1 = cos(phase_step), sin1 = sin(phase_step);
+  double cos2 = cos(2.0 * phase_step), sin2 = sin(2.0 * phase_step);
+  double cos3 = cos(3.0 * phase_step), sin3 = sin(3.0 * phase_step);
+  double c1 = 1.0, s1 = 0.0;
+  double c2 = 1.0, s2 = 0.0;
+  double c3 = 1.0, s3 = 0.0;
+  for (int i = 0; i < y_length; ++i) {
+    y[i] = 0.355768 - 0.487396 * c1 + 0.144232 * c2 - 0.012604 * c3;
+    double nc;
+    nc = c1 * cos1 - s1 * sin1; s1 = s1 * cos1 + c1 * sin1; c1 = nc;
+    nc = c2 * cos2 - s2 * sin2; s2 = s2 * cos2 + c2 * sin2; c2 = nc;
+    nc = c3 * cos3 - s3 * sin3; s3 = s3 * cos3 + c3 * sin3; c3 = nc;
+  }
+}
+
+//-----------------------------------------------------------------------------
 // GetFilteredSignal() calculates the signal that is the convolution of the
 // input signal and band-pass filter.
 //-----------------------------------------------------------------------------
 static void GetFilteredSignal(double boundary_f0, int fft_size, double fs,
-    const fft_complex *y_spectrum, int y_length, double *filtered_signal) {
+    const fft_complex *y_spectrum, int y_length, double *filtered_signal,
+    ForwardRealFFT *forward_real_fft, InverseRealFFT *inverse_real_fft) {
   int filter_length_half = matlab_round(fs / boundary_f0 * 2.0);
-  double *band_pass_filter = new double[fft_size];
-  NuttallWindow(filter_length_half * 2 + 1, band_pass_filter);
-  for (int i = -filter_length_half; i <= filter_length_half; ++i)
-    band_pass_filter[i + filter_length_half] *=
-      cos(2 * world::kPi * boundary_f0 * i / fs);
-  for (int i = filter_length_half * 2 + 1; i < fft_size; ++i)
-    band_pass_filter[i] = 0.0;
 
-  fft_complex *band_pass_filter_spectrum = new fft_complex[fft_size];
-  fft_plan forwardFFT = fft_plan_dft_r2c_1d(fft_size, band_pass_filter,
-    band_pass_filter_spectrum, FFT_ESTIMATE);
-  fft_execute(forwardFFT);
+  // Build band-pass filter using fast oscillator-based NuttallWindow
+  FastNuttallWindow(filter_length_half * 2 + 1, forward_real_fft->waveform);
 
-  // Convolution
-  double tmp = y_spectrum[0][0] * band_pass_filter_spectrum[0][0] -
-    y_spectrum[0][1] * band_pass_filter_spectrum[0][1];
-  band_pass_filter_spectrum[0][1] =
-    y_spectrum[0][0] * band_pass_filter_spectrum[0][1] +
-    y_spectrum[0][1] * band_pass_filter_spectrum[0][0];
-  band_pass_filter_spectrum[0][0] = tmp;
+  // Cos modulation via recursive oscillator (replaces per-sample cos() calls)
+  double w = 2.0 * world::kPi * boundary_f0 / fs;
+  double cos_w = cos(w), sin_w = sin(w);
+  double c = cos(-filter_length_half * w);
+  double s = sin(-filter_length_half * w);
+  for (int i = -filter_length_half; i <= filter_length_half; ++i) {
+    forward_real_fft->waveform[i + filter_length_half] *= c;
+    double nc = c * cos_w - s * sin_w;
+    s = s * cos_w + c * sin_w;
+    c = nc;
+  }
+  memset(forward_real_fft->waveform + filter_length_half * 2 + 1, 0,
+      (fft_size - filter_length_half * 2 - 1) * sizeof(double));
+
+  // Forward FFT of band-pass filter
+  fft_execute(forward_real_fft->forward_fft);
+
+  // Convolution (multiply spectra), store result in inverse FFT's spectrum
+  double tmp = y_spectrum[0][0] * forward_real_fft->spectrum[0][0] -
+    y_spectrum[0][1] * forward_real_fft->spectrum[0][1];
+  inverse_real_fft->spectrum[0][1] =
+    y_spectrum[0][0] * forward_real_fft->spectrum[0][1] +
+    y_spectrum[0][1] * forward_real_fft->spectrum[0][0];
+  inverse_real_fft->spectrum[0][0] = tmp;
+  // Only compute spectrum[1..N/2]. The conjugate mirror (spectrum[N/2+1..N-1])
+  // is NOT needed — Ooura's c2r only reads indices 0 through N/2.
   for (int i = 1; i <= fft_size / 2; ++i) {
-    tmp = y_spectrum[i][0] * band_pass_filter_spectrum[i][0] -
-      y_spectrum[i][1] * band_pass_filter_spectrum[i][1];
-    band_pass_filter_spectrum[i][1] =
-      y_spectrum[i][0] * band_pass_filter_spectrum[i][1] +
-      y_spectrum[i][1] * band_pass_filter_spectrum[i][0];
-    band_pass_filter_spectrum[i][0] = tmp;
-    band_pass_filter_spectrum[fft_size - i - 1][0] =
-      band_pass_filter_spectrum[i][0];
-    band_pass_filter_spectrum[fft_size - i - 1][1] =
-      band_pass_filter_spectrum[i][1];
+    tmp = y_spectrum[i][0] * forward_real_fft->spectrum[i][0] -
+      y_spectrum[i][1] * forward_real_fft->spectrum[i][1];
+    inverse_real_fft->spectrum[i][1] =
+      y_spectrum[i][0] * forward_real_fft->spectrum[i][1] +
+      y_spectrum[i][1] * forward_real_fft->spectrum[i][0];
+    inverse_real_fft->spectrum[i][0] = tmp;
   }
 
-  fft_plan inverseFFT = fft_plan_dft_c2r_1d(fft_size,
-    band_pass_filter_spectrum, filtered_signal, FFT_ESTIMATE);
-  fft_execute(inverseFFT);
+  // Inverse FFT
+  fft_execute(inverse_real_fft->inverse_fft);
 
   // Compensation of the delay.
   int index_bias = filter_length_half + 1;
   for (int i = 0; i < y_length; ++i)
-    filtered_signal[i] = filtered_signal[i + index_bias];
-
-  fft_destroy_plan(inverseFFT);
-  fft_destroy_plan(forwardFFT);
-  delete[] band_pass_filter_spectrum;
-  delete[] band_pass_filter;
+    filtered_signal[i] = inverse_real_fft->waveform[i + index_bias];
 }
 
 //-----------------------------------------------------------------------------
@@ -160,27 +187,20 @@ static inline int CheckEvent(int x) {
 // negative.
 //-----------------------------------------------------------------------------
 static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
-    double fs, double *interval_locations, double *intervals) {
-  int *negative_going_points = new int[y_length];
-
+    double fs, double *interval_locations, double *intervals,
+    int *negative_going_points, int *edges, double *fine_edges) {
   for (int i = 0; i < y_length - 1; ++i)
     negative_going_points[i] =
       0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 ? i + 1 : 0;
   negative_going_points[y_length - 1] = 0;
 
-  int *edges = new int[y_length];
   int count = 0;
   for (int i = 0; i < y_length; ++i)
     if (negative_going_points[i] > 0)
       edges[count++] = negative_going_points[i];
 
-  if (count < 2) {
-    delete[] edges;
-    delete[] negative_going_points;
-    return 0;
-  }
+  if (count < 2) return 0;
 
-  double *fine_edges = new double[count];
   for (int i = 0; i < count; ++i)
     fine_edges[i] = edges[i] - filtered_signal[edges[i] - 1] /
       (filtered_signal[edges[i]] - filtered_signal[edges[i] - 1]);
@@ -190,9 +210,6 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
     interval_locations[i] = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
   }
 
-  delete[] fine_edges;
-  delete[] edges;
-  delete[] negative_going_points;
   return count - 1;
 }
 
@@ -204,37 +221,32 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
 // the differential of waveform.
 //-----------------------------------------------------------------------------
 static void GetFourZeroCrossingIntervals(double *filtered_signal, int y_length,
-    double actual_fs, ZeroCrossings *zero_crossings) {
-  int maximum_number = y_length;
-  zero_crossings->negative_interval_locations = new double[maximum_number];
-  zero_crossings->positive_interval_locations = new double[maximum_number];
-  zero_crossings->peak_interval_locations = new double[maximum_number];
-  zero_crossings->dip_interval_locations = new double[maximum_number];
-  zero_crossings->negative_intervals = new double[maximum_number];
-  zero_crossings->positive_intervals = new double[maximum_number];
-  zero_crossings->peak_intervals = new double[maximum_number];
-  zero_crossings->dip_intervals = new double[maximum_number];
-
+    double actual_fs, ZeroCrossings *zero_crossings,
+    int *zc_points, int *zc_edges, double *zc_fine_edges) {
   zero_crossings->number_of_negatives = ZeroCrossingEngine(filtered_signal,
       y_length, actual_fs, zero_crossings->negative_interval_locations,
-      zero_crossings->negative_intervals);
+      zero_crossings->negative_intervals,
+      zc_points, zc_edges, zc_fine_edges);
 
   for (int i = 0; i < y_length; ++i) filtered_signal[i] = -filtered_signal[i];
   zero_crossings->number_of_positives = ZeroCrossingEngine(filtered_signal,
       y_length, actual_fs, zero_crossings->positive_interval_locations,
-      zero_crossings->positive_intervals);
+      zero_crossings->positive_intervals,
+      zc_points, zc_edges, zc_fine_edges);
 
   for (int i = 0; i < y_length - 1; ++i) filtered_signal[i] =
     filtered_signal[i] - filtered_signal[i + 1];
   zero_crossings->number_of_peaks = ZeroCrossingEngine(filtered_signal,
       y_length - 1, actual_fs, zero_crossings->peak_interval_locations,
-      zero_crossings->peak_intervals);
+      zero_crossings->peak_intervals,
+      zc_points, zc_edges, zc_fine_edges);
 
   for (int i = 0; i < y_length - 1; ++i)
     filtered_signal[i] = -filtered_signal[i];
   zero_crossings->number_of_dips = ZeroCrossingEngine(filtered_signal,
       y_length - 1, actual_fs, zero_crossings->dip_interval_locations,
-      zero_crossings->dip_intervals);
+      zero_crossings->dip_intervals,
+      zc_points, zc_edges, zc_fine_edges);
 }
 
 static void GetF0CandidateContourSub(const double * const *interpolated_f0_set,
@@ -259,7 +271,8 @@ static void GetF0CandidateContourSub(const double * const *interpolated_f0_set,
 //-----------------------------------------------------------------------------
 static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
     double boundary_f0, double f0_floor, double f0_ceil,
-    const double *temporal_positions, int f0_length, double *f0_candidate) {
+    const double *temporal_positions, int f0_length, double *f0_candidate,
+    double * const *interpolated_f0_set) {
   if (0 == CheckEvent(zero_crossings->number_of_negatives - 2) *
       CheckEvent(zero_crossings->number_of_positives - 2) *
       CheckEvent(zero_crossings->number_of_peaks - 2) *
@@ -267,10 +280,6 @@ static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
     for (int i = 0; i < f0_length; ++i) f0_candidate[i] = 0.0;
     return;
   }
-
-  double *interpolated_f0_set[4];
-  for (int i = 0; i < 4; ++i)
-    interpolated_f0_set[i] = new double[f0_length];
 
   interp1(zero_crossings->negative_interval_locations,
       zero_crossings->negative_intervals,
@@ -289,7 +298,6 @@ static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
 
   GetF0CandidateContourSub(interpolated_f0_set, f0_length, f0_floor,
       f0_ceil, boundary_f0, f0_candidate);
-  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
 }
 
 //-----------------------------------------------------------------------------
@@ -312,20 +320,18 @@ static void DestroyZeroCrossings(ZeroCrossings *zero_crossings) {
 static void GetF0CandidateFromRawEvent(double boundary_f0, double fs,
     const fft_complex *y_spectrum, int y_length, int fft_size, double f0_floor,
     double f0_ceil, const double *temporal_positions, int f0_length,
-    double *f0_candidate) {
-  double *filtered_signal = new double[fft_size];
+    double *f0_candidate, ForwardRealFFT *forward_real_fft,
+    InverseRealFFT *inverse_real_fft, double *filtered_signal,
+    ZeroCrossings *zero_crossings, int *zc_points, int *zc_edges,
+    double *zc_fine_edges, double **interpolated_f0_set) {
   GetFilteredSignal(boundary_f0, fft_size, fs, y_spectrum,
-      y_length, filtered_signal);
+      y_length, filtered_signal, forward_real_fft, inverse_real_fft);
 
-  ZeroCrossings zero_crossings = { 0 };
   GetFourZeroCrossingIntervals(filtered_signal, y_length, fs,
-      &zero_crossings);
+      zero_crossings, zc_points, zc_edges, zc_fine_edges);
 
-  GetF0CandidateContour(&zero_crossings, boundary_f0, f0_floor, f0_ceil,
-      temporal_positions, f0_length, f0_candidate);
-
-  DestroyZeroCrossings(&zero_crossings);
-  delete[] filtered_signal;
+  GetF0CandidateContour(zero_crossings, boundary_f0, f0_floor, f0_ceil,
+      temporal_positions, f0_length, f0_candidate, interpolated_f0_set);
 }
 
 //-----------------------------------------------------------------------------
@@ -335,11 +341,42 @@ static void GetRawF0Candidates(const double *boundary_f0_list,
     int number_of_bands, double actual_fs, int y_length,
     const double *temporal_positions, int f0_length,
     const fft_complex *y_spectrum, int fft_size, double f0_floor,
-    double f0_ceil, double **raw_f0_candidates) {
+    double f0_ceil, double **raw_f0_candidates,
+    ForwardRealFFT *forward_real_fft, InverseRealFFT *inverse_real_fft) {
+  double *filtered_signal = new double[fft_size];
+
+  // Pre-allocate ZeroCrossings buffers (reused across all channels)
+  ZeroCrossings zero_crossings = { 0 };
+  zero_crossings.negative_interval_locations = new double[y_length];
+  zero_crossings.positive_interval_locations = new double[y_length];
+  zero_crossings.peak_interval_locations = new double[y_length];
+  zero_crossings.dip_interval_locations = new double[y_length];
+  zero_crossings.negative_intervals = new double[y_length];
+  zero_crossings.positive_intervals = new double[y_length];
+  zero_crossings.peak_intervals = new double[y_length];
+  zero_crossings.dip_intervals = new double[y_length];
+  // ZeroCrossingEngine workspace
+  int *zc_points = new int[y_length];
+  int *zc_edges = new int[y_length];
+  double *zc_fine_edges = new double[y_length];
+  // interpolated_f0_set for GetF0CandidateContour
+  double *interpolated_f0_set[4];
+  for (int i = 0; i < 4; ++i)
+    interpolated_f0_set[i] = new double[f0_length];
+
   for (int i = 0; i < number_of_bands; ++i)
     GetF0CandidateFromRawEvent(boundary_f0_list[i], actual_fs, y_spectrum,
         y_length, fft_size, f0_floor, f0_ceil, temporal_positions, f0_length,
-        raw_f0_candidates[i]);
+        raw_f0_candidates[i], forward_real_fft, inverse_real_fft,
+        filtered_signal, &zero_crossings, zc_points, zc_edges,
+        zc_fine_edges, interpolated_f0_set);
+
+  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
+  delete[] zc_fine_edges;
+  delete[] zc_edges;
+  delete[] zc_points;
+  DestroyZeroCrossings(&zero_crossings);
+  delete[] filtered_signal;
 }
 
 //-----------------------------------------------------------------------------
@@ -446,12 +483,24 @@ static void GetBaseIndex(double current_position, const double *base_time,
 static void GetMainWindow(double current_position, const int *base_index,
     int base_time_length, double fs, double window_length_in_time,
     double *main_window) {
-  double tmp = 0.0;
+  // base_index[i] = base_index[0] + i (consecutive integers), so the cos
+  // arguments form an arithmetic sequence. Use recursive oscillators to
+  // replace 2 cos() per sample with 2 complex rotations.
+  double tmp0 = (base_index[0] - 1.0) / fs - current_position;
+  double w1 = 2.0 * world::kPi / (fs * window_length_in_time);
+  // Use double-angle formulas: cos(2θ) = 2cos²(θ)-1, sin(2θ) = 2sin(θ)cos(θ)
+  // Reduces trig calls from 8 to 4 per invocation
+  double cos_w1 = cos(w1), sin_w1 = sin(w1);
+  double cos_w2 = 2.0 * cos_w1 * cos_w1 - 1.0;
+  double sin_w2 = 2.0 * sin_w1 * cos_w1;
+  double phase1_0 = 2.0 * world::kPi * tmp0 / window_length_in_time;
+  double c1 = cos(phase1_0), s1 = sin(phase1_0);
+  double c2 = 2.0 * c1 * c1 - 1.0, s2 = 2.0 * s1 * c1;
   for (int i = 0; i < base_time_length; ++i) {
-    tmp = (base_index[i] - 1.0) / fs - current_position;
-    main_window[i] = 0.42 +
-      0.5 * cos(2.0 * world::kPi * tmp / window_length_in_time) +
-      0.08 * cos(4.0 * world::kPi * tmp / window_length_in_time);
+    main_window[i] = 0.42 + 0.5 * c1 + 0.08 * c2;
+    double nc;
+    nc = c1 * cos_w1 - s1 * sin_w1; s1 = s1 * cos_w1 + c1 * sin_w1; c1 = nc;
+    nc = c2 * cos_w2 - s2 * sin_w2; s2 = s2 * cos_w2 + c2 * sin_w2; c2 = nc;
   }
 }
 
@@ -507,8 +556,9 @@ static void GetSpectra(const double *x, int x_length, int fft_size,
 static void FixF0(const double *power_spectrum, const double *numerator_i,
     int fft_size, double fs, double current_f0, int number_of_harmonics,
     double *refined_f0, double *score) {
-  double *amplitude_list = new double[number_of_harmonics];
-  double *instantaneous_frequency_list = new double[number_of_harmonics];
+  // Use stack allocation for small fixed-size arrays (max 6 harmonics)
+  double amplitude_list[6];
+  double instantaneous_frequency_list[6];
 
   int index;
   for (int i = 0; i < number_of_harmonics; ++i) {
@@ -530,9 +580,149 @@ static void FixF0(const double *power_spectrum, const double *numerator_i,
 
   *refined_f0 = numerator / (denominator + world::kMySafeGuardMinimum);
   *score = 1.0 / (*score / number_of_harmonics + world::kMySafeGuardMinimum);
+}
 
-  delete[] amplitude_list;
-  delete[] instantaneous_frequency_list;
+//-----------------------------------------------------------------------------
+// Pre-allocated workspace for the refinement path.
+// Eliminates millions of new/delete calls per Harvest invocation.
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+// Pre-allocated workspace for the refinement path.
+// Pre-creates FFT plans for ALL possible fft_sizes (typically 6 sizes:
+// 64, 128, 256, 512, 1024, 2048) to eliminate plan destroy/recreate
+// when fft_size fluctuates between candidates. Buffers are allocated
+// once at the maximum required size.
+//-----------------------------------------------------------------------------
+static const int kMinLogFftSize = 6;   // 2^6 = 64
+static const int kMaxLogFftSize = 12;  // 2^12 = 4096
+static const int kNumFftSizes = kMaxLogFftSize - kMinLogFftSize + 1;
+
+typedef struct {
+  // Pre-created FFT plans indexed by log2(fft_size) - kMinLogFftSize
+  ForwardRealFFT plans[kNumFftSizes];
+  int plan_created[kNumFftSizes];
+
+  // Buffers allocated at max size (reused for all fft_sizes)
+  int max_fft_size;
+  int max_base_time_length;
+  fft_complex *main_spectrum;
+  fft_complex *diff_spectrum;
+  int *base_index;
+  double *main_window;
+  double *diff_window;
+  double *power_spectrum;
+  double *numerator_i;
+  int *safe_index;
+  double *base_time;
+} RefinementWorkspace;
+
+static int LogFftIndex(int fft_size) {
+  int log_size = 0;
+  int s = fft_size;
+  while (s > 1) { s >>= 1; log_size++; }
+  return log_size - kMinLogFftSize;
+}
+
+static void InitRefinementWorkspace(RefinementWorkspace *ws,
+    double fs, double f0_floor, double f0_ceil) {
+  // Determine max fft_size and max base_time_length from f0 range
+  int max_half_window = static_cast<int>(1.5 * fs / f0_floor + 1.0);
+  ws->max_base_time_length = max_half_window * 2 + 1;
+  {
+    int v = ws->max_base_time_length;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    ws->max_fft_size = ((v >> 1) + 1) << 2;
+  }
+  if (ws->max_fft_size < 64) ws->max_fft_size = 64;
+
+  // Pre-create FFT plans for all sizes that could be needed
+  for (int i = 0; i < kNumFftSizes; i++) {
+    ws->plan_created[i] = 0;
+  }
+  // Scan the f0 range to determine which fft_sizes are actually needed
+  // and pre-create plans for those sizes
+  for (double f0 = f0_floor; f0 <= f0_ceil; f0 *= 1.1) {
+    int hwl = static_cast<int>(1.5 * fs / f0 + 1.0);
+    int btl = hwl * 2 + 1;
+    int v = btl;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    int fft_size = ((v >> 1) + 1) << 2;
+    int idx = LogFftIndex(fft_size);
+    if (idx >= 0 && idx < kNumFftSizes && !ws->plan_created[idx]) {
+      InitializeForwardRealFFT(fft_size, &ws->plans[idx]);
+      ws->plan_created[idx] = 1;
+    }
+  }
+
+  // Allocate buffers at max size
+  ws->main_spectrum = new fft_complex[ws->max_fft_size];
+  ws->diff_spectrum = new fft_complex[ws->max_fft_size];
+  ws->power_spectrum = new double[ws->max_fft_size / 2 + 1];
+  ws->numerator_i = new double[ws->max_fft_size / 2 + 1];
+  ws->base_index = new int[ws->max_base_time_length];
+  ws->main_window = new double[ws->max_base_time_length];
+  ws->diff_window = new double[ws->max_base_time_length];
+  ws->safe_index = new int[ws->max_base_time_length];
+  ws->base_time = new double[ws->max_base_time_length];
+}
+
+static ForwardRealFFT *GetPlan(RefinementWorkspace *ws, int fft_size) {
+  int idx = LogFftIndex(fft_size);
+  if (idx >= 0 && idx < kNumFftSizes && ws->plan_created[idx]) {
+    return &ws->plans[idx];
+  }
+  // Lazily create if somehow missed during init
+  if (idx >= 0 && idx < kNumFftSizes) {
+    InitializeForwardRealFFT(fft_size, &ws->plans[idx]);
+    ws->plan_created[idx] = 1;
+    return &ws->plans[idx];
+  }
+  return NULL;  // should not happen
+}
+
+static void DestroyRefinementWorkspace(RefinementWorkspace *ws) {
+  for (int i = 0; i < kNumFftSizes; i++) {
+    if (ws->plan_created[i]) {
+      DestroyForwardRealFFT(&ws->plans[i]);
+    }
+  }
+  delete[] ws->main_spectrum;
+  delete[] ws->diff_spectrum;
+  delete[] ws->power_spectrum;
+  delete[] ws->numerator_i;
+  delete[] ws->base_index;
+  delete[] ws->main_window;
+  delete[] ws->diff_window;
+  delete[] ws->safe_index;
+  delete[] ws->base_time;
+}
+
+//-----------------------------------------------------------------------------
+// GetSpectra() calculates two spectra of the waveform windowed by windows
+// (main window and diff window). Uses workspace buffers.
+//-----------------------------------------------------------------------------
+static void GetSpectraWithWorkspace(const double *x, int x_length,
+    int fft_size, const int *base_index, const double *main_window,
+    const double *diff_window, int base_time_length,
+    ForwardRealFFT *forward_real_fft, fft_complex *main_spectrum,
+    fft_complex *diff_spectrum, int *safe_index) {
+  for (int i = 0; i < base_time_length; ++i)
+    safe_index[i] = MyMaxInt(0, MyMinInt(x_length - 1, base_index[i] - 1));
+  for (int i = 0; i < base_time_length; ++i)
+    forward_real_fft->waveform[i] = x[safe_index[i]] * main_window[i];
+  memset(forward_real_fft->waveform + base_time_length, 0,
+      (fft_size - base_time_length) * sizeof(double));
+
+  fft_execute(forward_real_fft->forward_fft);
+  memcpy(main_spectrum, forward_real_fft->spectrum,
+      (fft_size / 2 + 1) * sizeof(fft_complex));
+
+  for (int i = 0; i < base_time_length; ++i)
+    forward_real_fft->waveform[i] = x[safe_index[i]] * diff_window[i];
+  // Zero-pad already set from first pass (waveform[btl..fft_size-1] unchanged)
+  fft_execute(forward_real_fft->forward_fft);
+  memcpy(diff_spectrum, forward_real_fft->spectrum,
+      (fft_size / 2 + 1) * sizeof(fft_complex));
 }
 
 //-----------------------------------------------------------------------------
@@ -541,46 +731,31 @@ static void FixF0(const double *power_spectrum, const double *numerator_i,
 static void GetMeanF0(const double *x, int x_length, double fs,
     double current_position, double current_f0, int fft_size,
     double window_length_in_time, const double *base_time,
-    int base_time_length, double *refined_f0, double *refined_score) {
-  ForwardRealFFT forward_real_fft = { 0 };
-  InitializeForwardRealFFT(fft_size, &forward_real_fft);
-  fft_complex *main_spectrum = new fft_complex[fft_size];
-  fft_complex *diff_spectrum = new fft_complex[fft_size];
+    int base_time_length, double *refined_f0, double *refined_score,
+    RefinementWorkspace *ws) {
+  GetBaseIndex(current_position, base_time, base_time_length, fs,
+      ws->base_index);
+  GetMainWindow(current_position, ws->base_index, base_time_length, fs,
+      window_length_in_time, ws->main_window);
+  GetDiffWindow(ws->main_window, base_time_length, ws->diff_window);
 
-  int *base_index = new int[base_time_length];
-  double *main_window = new double[base_time_length];
-  double *diff_window = new double[base_time_length];
+  ForwardRealFFT *plan = GetPlan(ws, fft_size);
+  GetSpectraWithWorkspace(x, x_length, fft_size, ws->base_index,
+      ws->main_window, ws->diff_window, base_time_length,
+      plan, ws->main_spectrum, ws->diff_spectrum,
+      ws->safe_index);
 
-  GetBaseIndex(current_position, base_time, base_time_length, fs, base_index);
-  GetMainWindow(current_position, base_index, base_time_length, fs,
-      window_length_in_time, main_window);
-  GetDiffWindow(main_window, base_time_length, diff_window);
-
-  GetSpectra(x, x_length, fft_size, base_index, main_window, diff_window,
-      base_time_length, &forward_real_fft, main_spectrum, diff_spectrum);
-
-  double *power_spectrum = new double[fft_size / 2 + 1];
-  double *numerator_i = new double[fft_size / 2 + 1];
   for (int j = 0; j <= fft_size / 2; ++j) {
-    numerator_i[j] = main_spectrum[j][0] * diff_spectrum[j][1] -
-      main_spectrum[j][1] * diff_spectrum[j][0];
-    power_spectrum[j] = main_spectrum[j][0] * main_spectrum[j][0] +
-      main_spectrum[j][1] * main_spectrum[j][1];
+    ws->numerator_i[j] = ws->main_spectrum[j][0] * ws->diff_spectrum[j][1] -
+      ws->main_spectrum[j][1] * ws->diff_spectrum[j][0];
+    ws->power_spectrum[j] = ws->main_spectrum[j][0] * ws->main_spectrum[j][0] +
+      ws->main_spectrum[j][1] * ws->main_spectrum[j][1];
   }
 
   int number_of_harmonics =
     MyMinInt(static_cast<int>(fs / 2.0 / current_f0), 6);
-  FixF0(power_spectrum, numerator_i, fft_size, fs, current_f0,
+  FixF0(ws->power_spectrum, ws->numerator_i, fft_size, fs, current_f0,
       number_of_harmonics, refined_f0, refined_score);
-
-  delete[] diff_spectrum;
-  delete[] diff_window;
-  delete[] main_window;
-  delete[] base_index;
-  delete[] numerator_i;
-  delete[] power_spectrum;
-  delete[] main_spectrum;
-  DestroyForwardRealFFT(&forward_real_fft);
 }
 
 //-----------------------------------------------------------------------------
@@ -588,7 +763,7 @@ static void GetMeanF0(const double *x, int x_length, double fs,
 //-----------------------------------------------------------------------------
 static void GetRefinedF0(const double *x, int x_length, double fs,
     double current_position, double current_f0, double f0_floor, double f0_ceil,
-    double *refined_f0, double *refined_score) {
+    double *refined_f0, double *refined_score, RefinementWorkspace *ws) {
   if (current_f0 <= 0.0) {
     *refined_f0 = 0.0;
     *refined_score = 0.0;
@@ -597,23 +772,26 @@ static void GetRefinedF0(const double *x, int x_length, double fs,
 
   int half_window_length = static_cast<int>(1.5 * fs / current_f0 + 1.0);
   double window_length_in_time = (2.0 * half_window_length + 1.0) / fs;
-  double *base_time = new double[half_window_length * 2 + 1];
-  for (int i = 0; i < half_window_length * 2 + 1; i++)
-    base_time[i] = (-half_window_length + i) / fs;
-  int fft_size = static_cast<int>(pow(2.0, 2.0 +
-    static_cast<int>(log(half_window_length * 2.0 + 1.0) / world::kLog2)));
+  int base_time_length = half_window_length * 2 + 1;
+  // Replace pow/log with integer bit operations (called millions of times)
+  // Original: pow(2, 2 + floor(log2(btl))) = 4 * highest_power_of_2 <= btl
+  int v = base_time_length;
+  v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+  int fft_size = (v >> 1) + 1;  // highest power of 2 <= base_time_length
+  fft_size <<= 2;  // multiply by 4
+
+  for (int i = 0; i < base_time_length; i++)
+    ws->base_time[i] = (-half_window_length + i) / fs;
 
   GetMeanF0(x, x_length, fs, current_position, current_f0, fft_size,
-      window_length_in_time, base_time, half_window_length * 2 + 1,
-      refined_f0, refined_score);
+      window_length_in_time, ws->base_time, base_time_length,
+      refined_f0, refined_score, ws);
 
   if (*refined_f0 < f0_floor || *refined_f0 > f0_ceil ||
       *refined_score < 2.5) {
     *refined_f0 = 0.0;
     *refined_score = 0.0;
   }
-
-  delete[] base_time;
 }
 
 //-----------------------------------------------------------------------------
@@ -623,11 +801,16 @@ static void RefineF0Candidates(const double *x, int x_length, double fs,
     const double *temporal_positions, int f0_length, int max_candidates,
     double f0_floor, double f0_ceil,
     double **refined_f0_candidates, double **f0_scores) {
+  RefinementWorkspace ws;
+  InitRefinementWorkspace(&ws, fs, f0_floor, f0_ceil);
+
   for (int i = 0; i < f0_length; i++)
     for (int j = 0; j < max_candidates; ++j)
       GetRefinedF0(x, x_length, fs, temporal_positions[i],
           refined_f0_candidates[i][j], f0_floor, f0_ceil,
-          &refined_f0_candidates[i][j], &f0_scores[i][j]);
+          &refined_f0_candidates[i][j], &f0_scores[i][j], &ws);
+
+  DestroyRefinementWorkspace(&ws);
 }
 
 //-----------------------------------------------------------------------------
@@ -1119,14 +1302,16 @@ static int HarvestGeneralBodySub(const double *boundary_f0_list,
     int number_of_channels, int f0_length, double actual_fs, int y_length,
     const double *temporal_positions, const fft_complex *y_spectrum,
     int fft_size, double f0_floor, double f0_ceil, int max_candidates,
-    double **f0_candidates) {
+    double **f0_candidates, ForwardRealFFT *forward_real_fft,
+    InverseRealFFT *inverse_real_fft) {
   double **raw_f0_candidates = new double *[number_of_channels];
   for (int i = 0; i < number_of_channels; ++i)
     raw_f0_candidates[i] = new double[f0_length];
 
   GetRawF0Candidates(boundary_f0_list, number_of_channels,
       actual_fs, y_length, temporal_positions, f0_length, y_spectrum,
-      fft_size, f0_floor, f0_ceil, raw_f0_candidates);
+      fft_size, f0_floor, f0_ceil, raw_f0_candidates,
+      forward_real_fft, inverse_real_fft);
 
   int number_of_candidates = DetectOfficialF0Candidates(raw_f0_candidates,
     number_of_channels, f0_length, max_candidates, f0_candidates);
@@ -1186,10 +1371,20 @@ static void HarvestGeneralBody(const double *x, int x_length, int fs,
     f0_candidates_score[i] = new double[max_candidates];
   }
 
+  // Pre-allocate FFT plans for band-pass filtering (reused across all channels)
+  ForwardRealFFT forward_real_fft = {0};
+  InverseRealFFT inverse_real_fft = {0};
+  InitializeForwardRealFFT(fft_size, &forward_real_fft);
+  InitializeInverseRealFFT(fft_size, &inverse_real_fft);
+
   int number_of_candidates = HarvestGeneralBodySub(boundary_f0_list,
     number_of_channels, f0_length, actual_fs, y_length, temporal_positions,
-    y_spectrum, fft_size, f0_floor, f0_ceil, max_candidates, f0_candidates) *
+    y_spectrum, fft_size, f0_floor, f0_ceil, max_candidates, f0_candidates,
+    &forward_real_fft, &inverse_real_fft) *
     overlap_parameter;
+
+  DestroyForwardRealFFT(&forward_real_fft);
+  DestroyInverseRealFFT(&inverse_real_fft);
 
   RefineF0Candidates(y, y_length, actual_fs, temporal_positions, f0_length,
       number_of_candidates, f0_floor, f0_ceil, f0_candidates,

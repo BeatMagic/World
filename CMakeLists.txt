@@ -14,6 +14,20 @@ cmake_minimum_required(VERSION 3.0...3.30)
 # Build Options
 option(WORLD_BUILD_TESTS "Set to ON to build tests" OFF)
 option(WORLD_BUILD_EXAMPLES "Set to ON to build examples" ON)
+set(WORLD_FFT_BACKEND "auto" CACHE STRING "FFT backend: auto, fftw3, or ooura")
+set_property(CACHE WORLD_FFT_BACKEND PROPERTY STRINGS auto fftw3 ooura)
+
+# Auto-detect: prefer fftw3, fallback to ooura
+if(WORLD_FFT_BACKEND STREQUAL "auto")
+  find_library(FFTW3_LIB fftw3)
+  if(FFTW3_LIB)
+    set(WORLD_FFT_BACKEND "fftw3")
+    message(STATUS "FFT backend: fftw3 (auto-detected)")
+  else()
+    set(WORLD_FFT_BACKEND "ooura")
+    message(STATUS "FFT backend: ooura (fftw3 not found)")
+  endif()
+endif()
 
 # use git version as library version
 find_package(Git QUIET)
@@ -49,7 +63,7 @@ add_library(world STATIC
         src/common.cpp
         src/d4c.cpp
         src/dio.cpp
-        src/fft.cpp
+        $<IF:$<STREQUAL:${WORLD_FFT_BACKEND},fftw3>,src/fft_fftw3.cpp,src/fft.cpp>
         src/harvest.cpp
         src/matlabfunctions.cpp
         src/stonemask.cpp
@@ -79,6 +93,11 @@ endif()
 target_compile_options(world PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native -ffast-math -funroll-loops>
 )
+
+# FFTW3 linking
+if(WORLD_FFT_BACKEND STREQUAL "fftw3")
+  target_link_libraries(world PUBLIC ${FFTW3_LIB})
+endif()
 
 foreach (lib world world_tool)
     set_target_properties(${lib}

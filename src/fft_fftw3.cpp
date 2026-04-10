@@ -76,7 +76,28 @@ fft_plan fft_plan_dft_r2c_1d(int n, double *in, fft_complex *out,
 
 void fft_execute(fft_plan p) {
   fftw_plan plan = reinterpret_cast<fftw_plan>(p.input);
-  fftw_execute(plan);
+  // Use FFTW "new-array execute" API so that changing p.in/p.c_in/p.c_out/p.out
+  // after plan creation takes effect. World code (e.g. DIO) sometimes modifies
+  // the fft_plan struct's buffer pointers between plan creation and execution.
+  if (p.sign == FFT_FORWARD) {
+    if (p.c_in == NULL) {  // r2c
+      fftw_execute_dft_r2c(plan, p.in,
+          reinterpret_cast<fftw_complex *>(p.c_out));
+    } else {  // c2c forward
+      fftw_execute_dft(plan,
+          reinterpret_cast<fftw_complex *>(p.c_in),
+          reinterpret_cast<fftw_complex *>(p.c_out));
+    }
+  } else {  // FFT_BACKWARD
+    if (p.c_out == NULL) {  // c2r
+      fftw_execute_dft_c2r(plan,
+          reinterpret_cast<fftw_complex *>(p.c_in), p.out);
+    } else {  // c2c backward
+      fftw_execute_dft(plan,
+          reinterpret_cast<fftw_complex *>(p.c_in),
+          reinterpret_cast<fftw_complex *>(p.c_out));
+    }
+  }
 }
 
 void fft_destroy_plan(fft_plan p) {

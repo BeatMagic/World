@@ -38,20 +38,23 @@ static void DeSuddenChange(double *f0, int f0_length) {
 // ComputeZeroCrossingRate() computes the zero-crossing rate per frame,
 // matching librosa.feature.zero_crossing_rate with center=True, pad=True.
 //
+// When called with pad=True (the default in Python reference), librosa's
+// zero_crossings sets position 0 of every frame to True (always a crossing).
+// In librosa 0.11+, zero_crossing_rate has no explicit 'pad' parameter, so
+// pad=True flows through **kwargs into zero_crossings unchanged.
+//
 // Approach:
 //   1. Compute per-sample crossings on raw signal (unsigned: 1 if sign change)
-//   2. Prepend one zero element (pad=True offset)
-//   3. Center-pad the crossings array with zeros (frame_length/2 each side)
-//   4. Frame the crossings array and compute mean per frame
+//   2. Center-pad the crossings array with zeros (frame_length/2 each side)
+//   3. Frame and compute mean: position 0 always counts as 1 (pad=True),
+//      positions 1..frame_length-1 use real crossings
 //-----------------------------------------------------------------------------
 static void ComputeZeroCrossingRate(const double *x, int x_length,
     int frame_length, int hop_length, double *zcr, int zcr_length) {
-  // Step 1: Compute per-sample crossings on raw signal
   int raw_len = x_length - 1;
 
-  // Step 2+3: Build padded crossings array
-  // Layout: [zeros * pad_length] [prepend 0] [raw crossings] [zeros * pad_length]
   int pad_length = frame_length / 2;
+  // Layout: [zeros * pad_length] [prepend 0] [raw crossings] [zeros * pad_length]
   int total_len = pad_length + 1 + raw_len + pad_length;
   double *crossings = new double[total_len];
   memset(crossings, 0, total_len * sizeof(double));
@@ -62,11 +65,13 @@ static void ComputeZeroCrossingRate(const double *x, int x_length,
     crossings[pad_length + 1 + i] = (sign_curr != sign_next) ? 1.0 : 0.0;
   }
 
-  // Step 4: Frame crossings and compute mean
+  // Frame crossings and compute mean.
+  // Position 0 of every frame is always 1.0 (matching librosa pad=True).
+  // Positions 1..frame_length-1 use the real crossings from the global array.
   for (int frame = 0; frame < zcr_length; ++frame) {
     int start = frame * hop_length;
-    double sum = 0.0;
-    for (int i = 0; i < frame_length; ++i) {
+    double sum = 1.0;  // pad=True: position 0 always counts as a crossing
+    for (int i = 1; i < frame_length; ++i) {
       int idx = start + i;
       if (idx < total_len) sum += crossings[idx];
     }

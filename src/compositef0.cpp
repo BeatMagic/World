@@ -38,32 +38,18 @@ static void DeSuddenChange(double *f0, int f0_length) {
 // ComputeZeroCrossingRate() computes the zero-crossing rate per frame,
 // matching librosa.feature.zero_crossing_rate with center=True, pad=True.
 //
-// Approach (matching librosa internals):
-//   1. Threshold near-zero samples (|y| <= 1e-10 forced positive)
-//   2. Compute per-sample crossings: diff(signbit(x)) on raw signal
-//   3. Prepend one zero element (librosa zero_crossings pad=True)
-//   4. Center-pad the crossings array with zeros (frame_length/2 each side)
-//   5. Frame the crossings array and compute mean per frame
+// Approach:
+//   1. Compute per-sample crossings on raw signal (unsigned: 1 if sign change)
+//   2. Prepend one zero element (pad=True offset)
+//   3. Center-pad the crossings array with zeros (frame_length/2 each side)
+//   4. Frame the crossings array and compute mean per frame
 //-----------------------------------------------------------------------------
 static void ComputeZeroCrossingRate(const double *x, int x_length,
     int frame_length, int hop_length, double *zcr, int zcr_length) {
-  // Step 1: Copy signal and apply threshold (librosa default threshold=1e-10)
-  double *y = new double[x_length];
-  double ref_magnitude = 0.0;
-  for (int i = 0; i < x_length; ++i) {
-    double a = fabs(x[i]);
-    if (a > ref_magnitude) ref_magnitude = a;
-  }
-  if (ref_magnitude == 0.0) ref_magnitude = 1.0;
-  for (int i = 0; i < x_length; ++i) {
-    y[i] = (fabs(x[i]) <= 1e-10) ? x[i] + ref_magnitude : x[i];
-  }
-
-  // Step 2: Compute per-sample crossings: diff(signbit(y))
-  // crossings[i] = signbit(y[i+1]) - signbit(y[i]), values in {-1, 0, 1}
+  // Step 1: Compute per-sample crossings on raw signal
   int raw_len = x_length - 1;
 
-  // Step 3+4: Build padded crossings array
+  // Step 2+3: Build padded crossings array
   // Layout: [zeros * pad_length] [prepend 0] [raw crossings] [zeros * pad_length]
   int pad_length = frame_length / 2;
   int total_len = pad_length + 1 + raw_len + pad_length;
@@ -71,12 +57,12 @@ static void ComputeZeroCrossingRate(const double *x, int x_length,
   memset(crossings, 0, total_len * sizeof(double));
 
   for (int i = 0; i < raw_len; ++i) {
-    int sb_curr = (y[i] < 0.0) ? 1 : 0;
-    int sb_next = (y[i + 1] < 0.0) ? 1 : 0;
-    crossings[pad_length + 1 + i] = static_cast<double>(sb_next - sb_curr);
+    bool sign_curr = x[i] < 0.0;
+    bool sign_next = x[i + 1] < 0.0;
+    crossings[pad_length + 1 + i] = (sign_curr != sign_next) ? 1.0 : 0.0;
   }
 
-  // Step 5: Frame crossings and compute mean
+  // Step 4: Frame crossings and compute mean
   for (int frame = 0; frame < zcr_length; ++frame) {
     int start = frame * hop_length;
     double sum = 0.0;
@@ -87,7 +73,6 @@ static void ComputeZeroCrossingRate(const double *x, int x_length,
     zcr[frame] = sum / frame_length;
   }
 
-  delete[] y;
   delete[] crossings;
 }
 

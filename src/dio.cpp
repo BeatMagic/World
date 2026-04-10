@@ -8,7 +8,6 @@
 #include "world/dio.h"
 
 #include <math.h>
-#include <string.h>
 
 #include "world/common.h"
 #include "world/constantnumbers.h"
@@ -35,30 +34,6 @@ typedef struct {
 } ZeroCrossings;
 
 namespace {
-//-----------------------------------------------------------------------------
-// Fast NuttallWindow using recursive oscillators instead of cos() calls.
-//-----------------------------------------------------------------------------
-static void FastNuttallWindow(int y_length, double *y) {
-  if (y_length <= 1) {
-    if (y_length == 1) y[0] = 1.0;
-    return;
-  }
-  double phase_step = 2.0 * world::kPi / (y_length - 1);
-  double cos1 = cos(phase_step), sin1 = sin(phase_step);
-  double cos2 = cos(2.0 * phase_step), sin2 = sin(2.0 * phase_step);
-  double cos3 = cos(3.0 * phase_step), sin3 = sin(3.0 * phase_step);
-  double c1 = 1.0, s1 = 0.0;
-  double c2 = 1.0, s2 = 0.0;
-  double c3 = 1.0, s3 = 0.0;
-  for (int i = 0; i < y_length; ++i) {
-    y[i] = 0.355768 - 0.487396 * c1 + 0.144232 * c2 - 0.012604 * c3;
-    double nc;
-    nc = c1 * cos1 - s1 * sin1; s1 = s1 * cos1 + c1 * sin1; c1 = nc;
-    nc = c2 * cos2 - s2 * sin2; s2 = s2 * cos2 + c2 * sin2; c2 = nc;
-    nc = c3 * cos3 - s3 * sin3; s3 = s3 * cos3 + c3 * sin3; c3 = nc;
-  }
-}
-
 //-----------------------------------------------------------------------------
 // DesignLowCutFilter() calculates the coefficients the filter.
 //-----------------------------------------------------------------------------
@@ -319,39 +294,52 @@ static void FixF0Contour(double frame_period, int number_of_candidates,
 // This function is only used in RawEventByDio()
 //-----------------------------------------------------------------------------
 static void GetFilteredSignal(int half_average_length, int fft_size,
-    const fft_complex *y_spectrum, int y_length, double *filtered_signal,
-    ForwardRealFFT *forward_real_fft, InverseRealFFT *inverse_real_fft) {
-  // Build low-pass filter using fast oscillator-based NuttallWindow
-  FastNuttallWindow(half_average_length * 4, forward_real_fft->waveform);
-  memset(forward_real_fft->waveform + half_average_length * 4, 0,
-      (fft_size - half_average_length * 4) * sizeof(double));
+    const fft_complex *y_spectrum, int y_length, double *filtered_signal) {
+  double *low_pass_filter = new double[fft_size];
+  // Nuttall window is used as a low-pass filter.
+  // Cutoff frequency depends on the window length.
+  NuttallWindow(half_average_length * 4, low_pass_filter);
+  for (int i = half_average_length * 4; i < fft_size; ++i)
+    low_pass_filter[i] = 0.0;
 
-  // Forward FFT of filter
-  fft_execute(forward_real_fft->forward_fft);
+  fft_complex *low_pass_filter_spectrum = new fft_complex[fft_size];
+  fft_plan forwardFFT = fft_plan_dft_r2c_1d(fft_size, low_pass_filter,
+      low_pass_filter_spectrum, FFT_ESTIMATE);
+  fft_execute(forwardFFT);
 
-  // Convolution — only [0..N/2], mirror copy not needed (c2r only reads this range)
-  double tmp = y_spectrum[0][0] * forward_real_fft->spectrum[0][0] -
-    y_spectrum[0][1] * forward_real_fft->spectrum[0][1];
-  inverse_real_fft->spectrum[0][1] =
-    y_spectrum[0][0] * forward_real_fft->spectrum[0][1] +
-    y_spectrum[0][1] * forward_real_fft->spectrum[0][0];
-  inverse_real_fft->spectrum[0][0] = tmp;
+  // Convolution
+  double tmp = y_spectrum[0][0] * low_pass_filter_spectrum[0][0] -
+    y_spectrum[0][1] * low_pass_filter_spectrum[0][1];
+  low_pass_filter_spectrum[0][1] =
+    y_spectrum[0][0] * low_pass_filter_spectrum[0][1] +
+    y_spectrum[0][1] * low_pass_filter_spectrum[0][0];
+  low_pass_filter_spectrum[0][0] = tmp;
   for (int i = 1; i <= fft_size / 2; ++i) {
-    tmp = y_spectrum[i][0] * forward_real_fft->spectrum[i][0] -
-      y_spectrum[i][1] * forward_real_fft->spectrum[i][1];
-    inverse_real_fft->spectrum[i][1] =
-      y_spectrum[i][0] * forward_real_fft->spectrum[i][1] +
-      y_spectrum[i][1] * forward_real_fft->spectrum[i][0];
-    inverse_real_fft->spectrum[i][0] = tmp;
+    tmp = y_spectrum[i][0] * low_pass_filter_spectrum[i][0] -
+      y_spectrum[i][1] * low_pass_filter_spectrum[i][1];
+    low_pass_filter_spectrum[i][1] =
+      y_spectrum[i][0] * low_pass_filter_spectrum[i][1] +
+      y_spectrum[i][1] * low_pass_filter_spectrum[i][0];
+    low_pass_filter_spectrum[i][0] = tmp;
+    low_pass_filter_spectrum[fft_size - i - 1][0] =
+      low_pass_filter_spectrum[i][0];
+    low_pass_filter_spectrum[fft_size - i - 1][1] =
+      low_pass_filter_spectrum[i][1];
   }
 
-  // Inverse FFT
-  fft_execute(inverse_real_fft->inverse_fft);
+  fft_plan inverseFFT = fft_plan_dft_c2r_1d(fft_size,
+    low_pass_filter_spectrum, filtered_signal, FFT_ESTIMATE);
+  fft_execute(inverseFFT);
 
   // Compensation of the delay.
   int index_bias = half_average_length * 2;
   for (int i = 0; i < y_length; ++i)
-    filtered_signal[i] = inverse_real_fft->waveform[i + index_bias];
+    filtered_signal[i] = filtered_signal[i + index_bias];
+
+  fft_destroy_plan(inverseFFT);
+  fft_destroy_plan(forwardFFT);
+  delete[] low_pass_filter_spectrum;
+  delete[] low_pass_filter;
 }
 
 //-----------------------------------------------------------------------------
@@ -367,20 +355,27 @@ static inline int CheckEvent(int x) {
 // negative. Thanks to Custom.Maid http://custom-made.seesaa.net/ (2012/8/19)
 //-----------------------------------------------------------------------------
 static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
-    double fs, double *interval_locations, double *intervals,
-    int *negative_going_points, int *edges, double *fine_edges) {
+    double fs, double *interval_locations, double *intervals) {
+  int *negative_going_points = new int[y_length];
+
   for (int i = 0; i < y_length - 1; ++i)
     negative_going_points[i] =
       0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 ? i + 1 : 0;
   negative_going_points[y_length - 1] = 0;
 
+  int *edges = new int[y_length];
   int count = 0;
   for (int i = 0; i < y_length; ++i)
     if (negative_going_points[i] > 0)
       edges[count++] = negative_going_points[i];
 
-  if (count < 2) return 0;
+  if (count < 2) {
+    delete[] edges;
+    delete[] negative_going_points;
+    return 0;
+  }
 
+  double *fine_edges = new double[count];
   for (int i = 0; i < count; ++i)
     fine_edges[i] =
       edges[i] - filtered_signal[edges[i] - 1] /
@@ -391,6 +386,9 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
     interval_locations[i] = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
   }
 
+  delete[] fine_edges;
+  delete[] edges;
+  delete[] negative_going_points;
   return count - 1;
 }
 
@@ -402,32 +400,38 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
 // the differential of waveform.
 //-----------------------------------------------------------------------------
 static void GetFourZeroCrossingIntervals(double *filtered_signal, int y_length,
-    double actual_fs, ZeroCrossings *zero_crossings,
-    int *zc_points, int *zc_edges, double *zc_fine_edges) {
+    double actual_fs, ZeroCrossings *zero_crossings) {
+  // x_length / 4 (old version) is fixed at 2013/07/14
+  const int kMaximumNumber = y_length;
+  zero_crossings->negative_interval_locations = new double[kMaximumNumber];
+  zero_crossings->positive_interval_locations = new double[kMaximumNumber];
+  zero_crossings->peak_interval_locations = new double[kMaximumNumber];
+  zero_crossings->dip_interval_locations = new double[kMaximumNumber];
+  zero_crossings->negative_intervals = new double[kMaximumNumber];
+  zero_crossings->positive_intervals = new double[kMaximumNumber];
+  zero_crossings->peak_intervals = new double[kMaximumNumber];
+  zero_crossings->dip_intervals = new double[kMaximumNumber];
+
   zero_crossings->number_of_negatives = ZeroCrossingEngine(filtered_signal,
       y_length, actual_fs, zero_crossings->negative_interval_locations,
-      zero_crossings->negative_intervals,
-      zc_points, zc_edges, zc_fine_edges);
+      zero_crossings->negative_intervals);
 
   for (int i = 0; i < y_length; ++i) filtered_signal[i] = -filtered_signal[i];
   zero_crossings->number_of_positives = ZeroCrossingEngine(filtered_signal,
       y_length, actual_fs, zero_crossings->positive_interval_locations,
-      zero_crossings->positive_intervals,
-      zc_points, zc_edges, zc_fine_edges);
+      zero_crossings->positive_intervals);
 
   for (int i = 0; i < y_length - 1; ++i) filtered_signal[i] =
     filtered_signal[i] - filtered_signal[i + 1];
   zero_crossings->number_of_peaks = ZeroCrossingEngine(filtered_signal,
       y_length - 1, actual_fs, zero_crossings->peak_interval_locations,
-      zero_crossings->peak_intervals,
-      zc_points, zc_edges, zc_fine_edges);
+      zero_crossings->peak_intervals);
 
   for (int i = 0; i < y_length - 1; ++i)
     filtered_signal[i] = -filtered_signal[i];
   zero_crossings->number_of_dips = ZeroCrossingEngine(filtered_signal,
       y_length - 1, actual_fs, zero_crossings->dip_interval_locations,
-      zero_crossings->dip_intervals,
-      zc_points, zc_edges, zc_fine_edges);
+      zero_crossings->dip_intervals);
 }
 
 //-----------------------------------------------------------------------------
@@ -467,8 +471,7 @@ static void GetF0CandidateContourSub(
 static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
     double boundary_f0, double f0_floor, double f0_ceil,
     const double *temporal_positions, int f0_length,
-    double *f0_candidate, double *f0_score,
-    double * const *interpolated_f0_set) {
+    double *f0_candidate, double *f0_score) {
   if (0 == CheckEvent(zero_crossings->number_of_negatives - 2) *
       CheckEvent(zero_crossings->number_of_positives - 2) *
       CheckEvent(zero_crossings->number_of_peaks - 2) *
@@ -479,6 +482,10 @@ static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
     }
     return;
   }
+
+  double *interpolated_f0_set[4];
+  for (int i = 0; i < 4; ++i)
+    interpolated_f0_set[i] = new double[f0_length];
 
   interp1(zero_crossings->negative_interval_locations,
       zero_crossings->negative_intervals,
@@ -497,6 +504,7 @@ static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
 
   GetF0CandidateContourSub(interpolated_f0_set, f0_length, f0_floor,
       f0_ceil, boundary_f0, f0_candidate, f0_score);
+  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
 }
 
 //-----------------------------------------------------------------------------
@@ -519,20 +527,20 @@ static void DestroyZeroCrossings(ZeroCrossings *zero_crossings) {
 static void GetF0CandidateFromRawEvent(double boundary_f0, double fs,
     const fft_complex *y_spectrum, int y_length, int fft_size, double f0_floor,
     double f0_ceil, const double *temporal_positions, int f0_length,
-    double *f0_score, double *f0_candidate,
-    ForwardRealFFT *forward_real_fft, InverseRealFFT *inverse_real_fft,
-    double *filtered_signal, ZeroCrossings *zero_crossings,
-    int *zc_points, int *zc_edges, double *zc_fine_edges,
-    double **interpolated_f0_set) {
+    double *f0_score, double *f0_candidate) {
+  double *filtered_signal = new double[fft_size];
   GetFilteredSignal(matlab_round(fs / boundary_f0 / 2.0), fft_size, y_spectrum,
-      y_length, filtered_signal, forward_real_fft, inverse_real_fft);
+      y_length, filtered_signal);
 
+  ZeroCrossings zero_crossings = {0};
   GetFourZeroCrossingIntervals(filtered_signal, y_length, fs,
-      zero_crossings, zc_points, zc_edges, zc_fine_edges);
+      &zero_crossings);
 
-  GetF0CandidateContour(zero_crossings, boundary_f0, f0_floor, f0_ceil,
-      temporal_positions, f0_length, f0_candidate, f0_score,
-      interpolated_f0_set);
+  GetF0CandidateContour(&zero_crossings, boundary_f0, f0_floor, f0_ceil,
+      temporal_positions, f0_length, f0_candidate, f0_score);
+
+  DestroyZeroCrossings(&zero_crossings);
+  delete[] filtered_signal;
 }
 
 //-----------------------------------------------------------------------------
@@ -546,53 +554,19 @@ static void GetF0CandidatesAndScores(const double *boundary_f0_list,
   double *f0_candidate = new double[f0_length];
   double *f0_score = new double[f0_length];
 
-  // Pre-allocate FFT plans (reused across all channels)
-  ForwardRealFFT forward_real_fft = {0};
-  InverseRealFFT inverse_real_fft = {0};
-  InitializeForwardRealFFT(fft_size, &forward_real_fft);
-  InitializeInverseRealFFT(fft_size, &inverse_real_fft);
-
-  // Pre-allocate buffers (reused across all channels)
-  double *filtered_signal = new double[fft_size];
-  ZeroCrossings zero_crossings = {0};
-  zero_crossings.negative_interval_locations = new double[y_length];
-  zero_crossings.positive_interval_locations = new double[y_length];
-  zero_crossings.peak_interval_locations = new double[y_length];
-  zero_crossings.dip_interval_locations = new double[y_length];
-  zero_crossings.negative_intervals = new double[y_length];
-  zero_crossings.positive_intervals = new double[y_length];
-  zero_crossings.peak_intervals = new double[y_length];
-  zero_crossings.dip_intervals = new double[y_length];
-  int *zc_points = new int[y_length];
-  int *zc_edges = new int[y_length];
-  double *zc_fine_edges = new double[y_length];
-  double *interpolated_f0_set[4];
-  for (int i = 0; i < 4; ++i)
-    interpolated_f0_set[i] = new double[f0_length];
-
   // Calculation of the acoustics events (zero-crossing)
   for (int i = 0; i < number_of_bands; ++i) {
     GetF0CandidateFromRawEvent(boundary_f0_list[i], actual_fs, y_spectrum,
         y_length, fft_size, f0_floor, f0_ceil, temporal_positions, f0_length,
-        f0_score, f0_candidate,
-        &forward_real_fft, &inverse_real_fft, filtered_signal,
-        &zero_crossings, zc_points, zc_edges, zc_fine_edges,
-        interpolated_f0_set);
+        f0_score, f0_candidate);
     for (int j = 0; j < f0_length; ++j) {
+      // A way to avoid zero division
       raw_f0_scores[i][j] = f0_score[j] /
         (f0_candidate[j] + world::kMySafeGuardMinimum);
       raw_f0_candidates[i][j] = f0_candidate[j];
     }
   }
 
-  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
-  delete[] zc_fine_edges;
-  delete[] zc_edges;
-  delete[] zc_points;
-  DestroyZeroCrossings(&zero_crossings);
-  delete[] filtered_signal;
-  DestroyForwardRealFFT(&forward_real_fft);
-  DestroyInverseRealFFT(&inverse_real_fft);
   delete[] f0_candidate;
   delete[] f0_score;
 }

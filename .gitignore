@@ -1,8 +1,11 @@
 # generated
 build/
+# Multiple build trees for different FFT backends (Phase -1 baseline, Phase 3.5 AOCL)
+build-*/
 
-# Test
+# Test: ignore WAVs except the benchmark input audio file
 *.wav
+!benchmarks/benchmark_audio.wav
 
 # Visual Studio
 visualstudio2015/.vs/
@@ -110,5 +113,11 @@ fabric.properties
 # Android studio 3.1+ serialized cache file
 .idea/caches/build_file_checksums.ser
 
-# Performance benchmark
-benchmarks/
+# Performance benchmark: track sources, ignore outputs + local FFTW builds.
+benchmarks/results/
+benchmarks/third_party/fftw-*/
+benchmarks/third_party/aocl-*/
+benchmarks/third_party/install*/
+benchmarks/third_party/*.tar.gz
+benchmarks/third_party/*.tar.bz2
+benchmarks/third_party/*.zip

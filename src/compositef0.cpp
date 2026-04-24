@@ -9,6 +9,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "simd/simd_dispatch.h"
 #include "world/common.h"
 #include "world/constantnumbers.h"
 #include "world/dio.h"
@@ -59,24 +60,14 @@ static void ComputeZeroCrossingRate(const double *x, int x_length,
   double *crossings = new double[total_len];
   memset(crossings, 0, total_len * sizeof(double));
 
-  for (int i = 0; i < raw_len; ++i) {
-    bool sign_curr = x[i] < 0.0;
-    bool sign_next = x[i + 1] < 0.0;
-    crossings[pad_length + 1 + i] = (sign_curr != sign_next) ? 1.0 : 0.0;
-  }
+  // K4: sign-change detect. Writes into crossings[pad_length+1..pad_length+raw_len].
+  world::simd::ZcrSignChange(x, raw_len, crossings + pad_length + 1);
 
-  // Frame crossings and compute mean.
+  // K5: frame crossings and compute mean.
   // Position 0 of every frame is always 1.0 (matching librosa pad=True).
   // Positions 1..frame_length-1 use the real crossings from the global array.
-  for (int frame = 0; frame < zcr_length; ++frame) {
-    int start = frame * hop_length;
-    double sum = 1.0;  // pad=True: position 0 always counts as a crossing
-    for (int i = 1; i < frame_length; ++i) {
-      int idx = start + i;
-      if (idx < total_len) sum += crossings[idx];
-    }
-    zcr[frame] = sum / frame_length;
-  }
+  world::simd::ZcrFrameSum(crossings, total_len, hop_length, frame_length,
+                           zcr_length, zcr);
 
   delete[] crossings;
 }
@@ -105,19 +96,54 @@ static void GaussianFilter1D(const double *x, int x_length, double sigma,
 
   // Convolution with reflect boundary (scipy 'reflect' mode:
   // index -1 maps to 1, -2 maps to 2, etc.)
-  for (int i = 0; i < x_length; ++i) {
-    double val = 0.0;
-    for (int j = 0; j < kernel_length; ++j) {
-      int idx = i + j - radius;
-      // Reflect boundary
-      if (idx < 0) idx = -idx;
-      if (idx >= x_length) idx = 2 * (x_length - 1) - idx;
-      // Clamp for safety
-      if (idx < 0) idx = 0;
-      if (idx >= x_length) idx = x_length - 1;
-      val += x[idx] * kernel[j];
+  //
+  // Split into three regions:
+  //   Left boundary  [0, radius)                    -- scalar with reflect
+  //   Interior       [radius, x_length - radius)    -- K8 dispatch (no reflect needed)
+  //   Right boundary [x_length - radius, x_length)  -- scalar with reflect
+  // Fallback to full scalar when x_length is too small for interior to exist.
+  if (x_length <= 2 * radius) {
+    for (int i = 0; i < x_length; ++i) {
+      double val = 0.0;
+      for (int j = 0; j < kernel_length; ++j) {
+        int idx = i + j - radius;
+        if (idx < 0) idx = -idx;
+        if (idx >= x_length) idx = 2 * (x_length - 1) - idx;
+        if (idx < 0) idx = 0;
+        if (idx >= x_length) idx = x_length - 1;
+        val += x[idx] * kernel[j];
+      }
+      y[i] = val;
     }
-    y[i] = val;
+  } else {
+    // Left boundary
+    for (int i = 0; i < radius; ++i) {
+      double val = 0.0;
+      for (int j = 0; j < kernel_length; ++j) {
+        int idx = i + j - radius;
+        if (idx < 0) idx = -idx;
+        if (idx >= x_length) idx = 2 * (x_length - 1) - idx;
+        if (idx < 0) idx = 0;
+        if (idx >= x_length) idx = x_length - 1;
+        val += x[idx] * kernel[j];
+      }
+      y[i] = val;
+    }
+    // Interior
+    world::simd::GaussianFilter1DInterior(x, x_length, kernel, radius, y);
+    // Right boundary
+    for (int i = x_length - radius; i < x_length; ++i) {
+      double val = 0.0;
+      for (int j = 0; j < kernel_length; ++j) {
+        int idx = i + j - radius;
+        if (idx < 0) idx = -idx;
+        if (idx >= x_length) idx = 2 * (x_length - 1) - idx;
+        if (idx < 0) idx = 0;
+        if (idx >= x_length) idx = x_length - 1;
+        val += x[idx] * kernel[j];
+      }
+      y[i] = val;
+    }
   }
 
   delete[] kernel;
@@ -131,6 +157,10 @@ int GetSamplesForCompositeF0(int fs, int x_length, double frame_period) {
 
 void CompositeF0(const double *x, int x_length, int fs,
     const CompositeF0Option *option, double *temporal_positions, double *f0) {
+  // Detect CPU + bind SIMD kernel function pointers. Thread-safe; no-op on
+  // subsequent calls.
+  world::simd::Initialize();
+
   double frame_period = option->frame_period;
   int f0_length = GetSamplesForCompositeF0(fs, x_length, frame_period);
   int hop_length = matlab_round(frame_period / 1000.0 * fs);
@@ -180,15 +210,11 @@ void CompositeF0(const double *x, int x_length, int fs,
   int effective_zcr_length = zcr_length;
   if (zcr_length == f0_length + 1) effective_zcr_length = f0_length;
 
-  // Step 8: Composite voicing decision
+  // Step 8: Composite voicing decision (K3)
   // np.where(zcr_d_a < 0.002, f0_harvest, np.where(f0_dio > 0, f0_harvest, 0))
-  for (int i = 0; i < f0_length; ++i) {
-    if (i < effective_zcr_length && zcr_d_a[i] >= option->zcr_threshold) {
-      f0[i] = (f0_dio[i] > 0.0) ? f0_harvest[i] : 0.0;
-    } else {
-      f0[i] = f0_harvest[i];
-    }
-  }
+  world::simd::CompositeF0Merge(f0_dio, f0_harvest, zcr_d_a, f0_length,
+                                effective_zcr_length,
+                                option->zcr_threshold, f0);
 
   delete[] f0_dio;
   delete[] temporal_dio;

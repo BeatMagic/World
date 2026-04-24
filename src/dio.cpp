@@ -10,6 +10,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "simd/simd_dispatch.h"
 #include "world/common.h"
 #include "world/constantnumbers.h"
 #include "world/matlabfunctions.h"
@@ -39,24 +40,7 @@ namespace {
 // Fast NuttallWindow using recursive oscillators instead of cos() calls.
 //-----------------------------------------------------------------------------
 static void FastNuttallWindow(int y_length, double *y) {
-  if (y_length <= 1) {
-    if (y_length == 1) y[0] = 1.0;
-    return;
-  }
-  double phase_step = 2.0 * world::kPi / (y_length - 1);
-  double cos1 = cos(phase_step), sin1 = sin(phase_step);
-  double cos2 = cos(2.0 * phase_step), sin2 = sin(2.0 * phase_step);
-  double cos3 = cos(3.0 * phase_step), sin3 = sin(3.0 * phase_step);
-  double c1 = 1.0, s1 = 0.0;
-  double c2 = 1.0, s2 = 0.0;
-  double c3 = 1.0, s3 = 0.0;
-  for (int i = 0; i < y_length; ++i) {
-    y[i] = 0.355768 - 0.487396 * c1 + 0.144232 * c2 - 0.012604 * c3;
-    double nc;
-    nc = c1 * cos1 - s1 * sin1; s1 = s1 * cos1 + c1 * sin1; c1 = nc;
-    nc = c2 * cos2 - s2 * sin2; s2 = s2 * cos2 + c2 * sin2; c2 = nc;
-    nc = c3 * cos3 - s3 * sin3; s3 = s3 * cos3 + c3 * sin3; c3 = nc;
-  }
+  world::simd::FastNuttallWindow8(y_length, y);
 }
 
 //-----------------------------------------------------------------------------
@@ -96,11 +80,8 @@ static void GetSpectrumForEstimation(const double *x, int x_length,
   else
     for (int i = 0; i < x_length; ++i) y[i] = x[i];
 
-  // Removal of the DC component (y = y - mean value of y)
-  double mean_y = 0.0;
-  for (int i = 0; i < y_length; ++i) mean_y += y[i];
-  mean_y /= y_length;
-  for (int i = 0; i < y_length; ++i) y[i] -= mean_y;
+  // Removal of the DC component (y = y - mean value of y) -- K2 dispatch.
+  world::simd::DcRemove(y, y_length);
   for (int i = y_length; i < fft_size; ++i) y[i] = 0.0;
 
   fft_plan forwardFFT =
@@ -115,15 +96,10 @@ static void GetSpectrumForEstimation(const double *x, int x_length,
   forwardFFT.c_out = filter_spectrum;
   fft_execute(forwardFFT);
 
-  double tmp = 0;
-  for (int i = 0; i <= fft_size / 2; ++i) {
-    // Complex number multiplications.
-    tmp = y_spectrum[i][0] * filter_spectrum[i][0] -
-      y_spectrum[i][1] * filter_spectrum[i][1];
-    y_spectrum[i][1] = y_spectrum[i][0] * filter_spectrum[i][1] +
-      y_spectrum[i][1] * filter_spectrum[i][0];
-    y_spectrum[i][0] = tmp;
-  }
+  // Complex spectrum multiplication in place (y_spectrum *= filter_spectrum)
+  // -- K1 dispatch.
+  world::simd::SpectrumMultiplyHalf(y_spectrum, filter_spectrum,
+                                    y_spectrum, fft_size / 2 + 1);
 
   fft_destroy_plan(forwardFFT);
   delete[] y;
@@ -329,21 +305,11 @@ static void GetFilteredSignal(int half_average_length, int fft_size,
   // Forward FFT of filter
   fft_execute(forward_real_fft->forward_fft);
 
-  // Convolution — only [0..N/2], mirror copy not needed (c2r only reads this range)
-  double tmp = y_spectrum[0][0] * forward_real_fft->spectrum[0][0] -
-    y_spectrum[0][1] * forward_real_fft->spectrum[0][1];
-  inverse_real_fft->spectrum[0][1] =
-    y_spectrum[0][0] * forward_real_fft->spectrum[0][1] +
-    y_spectrum[0][1] * forward_real_fft->spectrum[0][0];
-  inverse_real_fft->spectrum[0][0] = tmp;
-  for (int i = 1; i <= fft_size / 2; ++i) {
-    tmp = y_spectrum[i][0] * forward_real_fft->spectrum[i][0] -
-      y_spectrum[i][1] * forward_real_fft->spectrum[i][1];
-    inverse_real_fft->spectrum[i][1] =
-      y_spectrum[i][0] * forward_real_fft->spectrum[i][1] +
-      y_spectrum[i][1] * forward_real_fft->spectrum[i][0];
-    inverse_real_fft->spectrum[i][0] = tmp;
-  }
+  // Convolution only on [0..N/2] (K1 dispatch). Mirror copy not needed since
+  // c2r reads only indices 0..N/2.
+  world::simd::SpectrumMultiplyHalf(y_spectrum, forward_real_fft->spectrum,
+                                    inverse_real_fft->spectrum,
+                                    fft_size / 2 + 1);
 
   // Inverse FFT
   fft_execute(inverse_real_fft->inverse_fft);
@@ -369,15 +335,12 @@ static inline int CheckEvent(int x) {
 static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
     double fs, double *interval_locations, double *intervals,
     int *negative_going_points, int *edges, double *fine_edges) {
-  for (int i = 0; i < y_length - 1; ++i)
-    negative_going_points[i] =
-      0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 ? i + 1 : 0;
-  negative_going_points[y_length - 1] = 0;
-
+  // K6: detect zero-crossings (positive-to-nonpositive) and compact into edges.
+  // negative_going_points retained as unused workspace for API compatibility.
+  (void)negative_going_points;
   int count = 0;
-  for (int i = 0; i < y_length; ++i)
-    if (negative_going_points[i] > 0)
-      edges[count++] = negative_going_points[i];
+  world::simd::ZeroCrossingDetectAndCollect(filtered_signal, y_length,
+                                            edges, &count);
 
   if (count < 2) return 0;
 
@@ -386,10 +349,9 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
       edges[i] - filtered_signal[edges[i] - 1] /
       (filtered_signal[edges[i]] - filtered_signal[edges[i] - 1]);
 
-  for (int i = 0; i < count - 1; ++i) {
-    intervals[i] = fs / (fine_edges[i + 1] - fine_edges[i]);
-    interval_locations[i] = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
-  }
+  // K7: intervals + locations.
+  world::simd::ZeroCrossingIntervals(fine_edges, count, fs, intervals,
+                                     interval_locations);
 
   return count - 1;
 }

@@ -6,6 +6,100 @@ It can estimate Fundamental frequency (F0), aperiodicity and spectral envelope a
 This source code is released under the modified-BSD license.
 There is no patent in all algorithms in WORLD.
 
+## Performance optimization (AVX-512 + AOCL-FFTW)
+
+This fork adds an optional AVX-512 path to the CompositeF0 analysis pipeline
+(DIO + Harvest + ZCR + Gaussian filter + voicing merge), plus build-time
+support for [AOCL-FFTW](https://github.com/amd/amd-fftw) — AMD's fork of FFTW
+with AVX-512 codelets tuned for Zen4 / Zen5.
+
+The upstream WORLD library is unchanged in structure; the optimization is
+layered behind a thin runtime dispatcher. On non-AVX-512 CPUs (or when built
+without AVX-512 support), the library falls back to the scalar implementation
+automatically — no source changes needed.
+
+### Measured speedup (AMD Ryzen 9 9950X3D / znver5)
+
+CompositeF0 on a 44.1 kHz 12.7 s speech WAV (hop=256, 10-run best-of):
+
+| Configuration                          | FFT backend              | WORLD tier  | total_ms | vs baseline |
+| :------------------------------------- | :----------------------- | :---------- | -------: | ----------: |
+| baseline                               | upstream FFTW 3.3.10 AVX2 | scalar      |   720.1  |         —   |
+| WORLD AVX-512 (K1-K10)                 | upstream FFTW 3.3.10 AVX2 | AVX-512     |   693.8  |      -3.6%  |
+| AOCL-FFTW AVX-512                      | AOCL-FFTW 5.2 AVX-512    | scalar      |   618.1  |     -14.2%  |
+| **AOCL-FFTW AVX-512 + WORLD AVX-512**  | AOCL-FFTW 5.2 AVX-512    | AVX-512     | **577.7**|   **-19.8%**|
+
+F0 output matches the scalar reference element-wise (max absolute diff
+`~2e-12 Hz`, zero voicing-decision flips).
+
+### Runtime dispatcher
+
+The dispatcher (`src/simd/simd_dispatch.h`) detects AVX-512F/DQ/BW/VL at
+program start and binds one function pointer per SIMD kernel. No
+re-compilation or feature flag needed at call sites.
+
+Environment-variable overrides (useful for debugging and bisection):
+
+- `WORLD_FORCE_SIMD_TIER=scalar` — force scalar tier even on AVX-512 CPUs.
+- `WORLD_FORCE_SIMD_TIER=avx512` — force AVX-512 tier (no-op if the CPU or
+  build lacks support).
+- `WORLD_AVX512_DISABLE=K1,K3` or `=ALL` — selectively fall back specific
+  kernels (K1..K10) to scalar, to isolate a regression.
+
+### Building with AVX-512 + AOCL-FFTW
+
+On Windows we recommend **MSYS2 MinGW-w64** (GCC). MSVC works but does not
+support the AVX-512 subset flags that FFTW's own configure expects, so the
+FFTW build itself needs MinGW/GCC or WSL.
+
+1. Build the FFT backend once. AOCL-FFTW 5.2 source lives at
+   <https://github.com/amd/amd-fftw> (tag `5.2`). On MSYS2 MinGW-w64:
+
+   ```bash
+   ./bootstrap.sh
+   # NOTE: do NOT pass --enable-dynamic-dispatcher on MinGW — it requires
+   # GNU ifunc, which PE-COFF does not support. Omitting it compiles the
+   # AVX-512 codelets statically (no runtime dispatch), which is fine for
+   # a Zen4/Zen5-targeted build.
+   ./configure --prefix=/d/dev/fftw-aocl/install \
+       --enable-shared --disable-static \
+       --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 \
+       --enable-amd-opt \
+       --disable-dependency-tracking --with-our-malloc \
+       CFLAGS="-O3 -mtune=znver5 -march=znver5"
+   make -j && make install
+   ```
+
+   On Linux, add `--enable-dynamic-dispatcher` for a portable binary with
+   runtime codelet selection.
+
+2. Point CMake at the install prefix via `WORLD_AOCL_FFTW_DIR`:
+
+   ```bash
+   cmake -B build -G "MinGW Makefiles" \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DWORLD_AOCL_FFTW_DIR=/d/dev/fftw-aocl/install
+   cmake --build build -j
+   ```
+
+   CMake status line should print `FFT backend: AOCL-FFTW at ...`. If
+   `WORLD_AOCL_FFTW_DIR` is unset, CMake falls back to system FFTW3, then
+   to the bundled Ooura FFT.
+
+3. Runtime DLL: ensure the FFTW DLL directory is on `PATH` (Windows) or
+   `LD_LIBRARY_PATH` (Linux).
+
+### pyworld integration notes
+
+pyworld's `setup.py` invokes the WORLD C/C++ sources directly; to pick up
+AOCL-FFTW from Python the user needs to set `WORLD_AOCL_FFTW_DIR` (or
+`AOCL_ROOT`) in the build environment and adjust `setup.py` to compile the
+FFTW backend path (`src/fft_fftw3.cpp`) with the correct include / link
+flags. This is out of scope for this fork; a companion pyworld patch is
+tracked separately.
+
+---
+
 ## Introduction of WORLD family (2025/02/21)
 
 I introduce useful software in WORLD. If you want to introduce your project in WORLD, please contact me.

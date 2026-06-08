@@ -40,14 +40,14 @@ Tier g_active_tier = Tier::Scalar;
 bool g_cpu_has_avx512 = false;
 
 bool DetectAvx512() {
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
   __builtin_cpu_init();
   // Require F + DQ + BW + VL for the full mask/DQ/BW intrinsic surface.
   return __builtin_cpu_supports("avx512f")
       && __builtin_cpu_supports("avx512dq")
       && __builtin_cpu_supports("avx512bw")
       && __builtin_cpu_supports("avx512vl");
-#elif defined(_MSC_VER)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
   int info[4] = {0, 0, 0, 0};
   // Leaf 7, subleaf 0: extended features in EBX.
   __cpuidex(info, 7, 0);
